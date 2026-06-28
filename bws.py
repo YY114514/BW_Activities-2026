@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bilibili BW 预约抢票脚本（优化版） - 精细状态码处理 + 可配置重试延迟
-Python ≥3.8 仅依赖 requests
-可选依赖：orjson（超快 JSON 解析）、psutil（CPU 亲和/系统信息）
+Bilibili BW 预约抢票脚本（极致高效版）
 """
-# 安装依赖: pip install requests orjson psutil
-
-import sys, time, json, threading, requests, statistics, re, atexit, os
+import sys, time, json, threading, requests, statistics, re, atexit, os, random
 from datetime import datetime
 from requests.adapters import HTTPAdapter
-import importlib
-import importlib.util
+import importlib, importlib.util
 
-# Optional accel libs
-def _fast_json_loads(data):
-    return json.loads(data)
-
+# ── 可选加速库 ──
+_fast_json_loads = json.loads
 _spec = importlib.util.find_spec("orjson")
 if _spec is not None:
     orjson = importlib.import_module("orjson")
@@ -27,16 +20,22 @@ try:
 except ImportError:
     psutil = None
 
-# Windows 1 ms 定时器 & 进程优先级
+# ── Windows 性能优化 ──
 if sys.platform == "win32":
     try:
         import ctypes
         _winmm = ctypes.WinDLL("winmm")
         if _winmm.timeBeginPeriod(1) == 0:
             atexit.register(lambda: _winmm.timeEndPeriod(1))
-        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)  # HIGH_PRIORITY_CLASS
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
     except Exception:
         pass
+
+# F1 暂停支持（仅 Windows）
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 if psutil is not None:
     try:
@@ -49,7 +48,7 @@ if psutil is not None:
 
 _PERF_OFFSET_NS = time.perf_counter_ns() - time.time_ns()
 
-# ── 全局停止标志（原子） ──
+# ── 全局原子标志 ──
 STOP_RESERVE = threading.Event()
 
 # ── 0. 账号 Cookie ──
@@ -68,7 +67,7 @@ def _load_cookie() -> str:
         return ""
 
 RAW_COOKIE = _load_cookie()
-TICKET_DAYS = [3]  # 默认只看12号
+TICKET_DAYS = [3]                # 默认 12 号
 
 COOKIE_DICT = {kv.split("=", 1)[0].strip(): kv.split("=", 1)[1]
                for kv in RAW_COOKIE.split(";") if "=" in kv}
@@ -87,16 +86,14 @@ CFG = {
     "time_jitter_ms": 15,
     "preheat_rounds": 8,
     "dry_run":       False,
-    "debug":         True,
-    # 状态码重试延迟字典（单位：毫秒），可随时通过菜单修改
+    "debug":         False,
     "retry_delays": {
-        "75637": 500,    # 尚未开放
-        "412":   180000, # 风控
-        "429":   500,    # 限流
-        "76650": 100,    # 操作频繁
-        "-702":  100,    # 请求频率太快
-        "-1":    200,    # 网络错误
-        # 未知状态码默认快速重试，未在此字典中的状态码将使用 200ms 延迟
+        "75637": 500,
+        "412":   180000,
+        "429":   500,
+        "76650": 100,
+        "-702":  100,
+        "-1":    200,
         "default": 200
     }
 }
@@ -105,9 +102,7 @@ DAY_MAP = {1: 20260710, 2: 20260711, 3: 20260712}
 
 # ── 2. Session 初始化 ──
 HEADERS = {
-    "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/540.36 (KHTML, like Gecko) "
-                   "Chrome/125.0.0.0 Safari/540.36"),
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/540.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/540.36",
     "origin":  "https://www.bilibili.com",
     "referer": "https://www.bilibili.com/blackboard/era/bws2026-event.html",
     "accept": "application/json, text/plain, */*",
@@ -117,28 +112,34 @@ HEADERS = {
 
 sess = requests.Session()
 sess.headers.update(HEADERS)
-pool_size = CFG["threads"] * CFG.get("requests_per_thread", 2) * 2
+pool_size = CFG["threads"] * CFG["requests_per_thread"] * 2
 sess.mount("https://", HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size, pool_block=True))
 for k, v in COOKIE_DICT.items():
     sess.cookies.set(k, v, domain=".bilibili.com")
 
+# 选择底层 HTTP 客户端（一次判定，避免热路径重复检查）
 _httpx_cli = None
-_spec_httpx = importlib.util.find_spec("httpx")
-if _spec_httpx is not None:
-    httpx = importlib.import_module("httpx")
+if importlib.util.find_spec("httpx") is not None:
+    import httpx
     _httpx_cli = httpx.Client(http2=True, headers=HEADERS, timeout=2.0)
 
-def _http_post(url: str, data: bytes, headers: dict[str, str]):
+def _post_func(url, data, hdr):
+    """直接调用，避免热路径间接调用开销"""
     if _httpx_cli is not None:
-        return _httpx_cli.post(url, content=data, headers=headers)
-    return sess.post(url, data=data, headers=headers, timeout=(1, 2))
+        return _httpx_cli.post(url, content=data, headers=hdr)
+    return sess.post(url, data=data, headers=hdr, timeout=(1, 2))
 
+# 日志输出函数
 def log(*msg):
     print(time.strftime("[%H:%M:%S]"), *msg, flush=True)
 
-def dbg(*msg):
-    if CFG.get("debug"):
+# 调试函数：debug=False 时置为空函数，消除调用开销
+if CFG["debug"]:
+    def dbg(*msg):
         log("DEBUG:", *msg)
+else:
+    def dbg(*msg):
+        pass
 
 # ── 3. 服务器时间同步 ──
 _TIME_SOURCES = [
@@ -147,57 +148,46 @@ _TIME_SOURCES = [
 ]
 _TIME_OFFSET = 0.0
 _OFFSET_TS   = 0.0
+_CALIBRATED  = False
 
 def _calibrate_offset(samples: int = 20):
-    global _TIME_OFFSET, _OFFSET_TS
+    global _TIME_OFFSET, _OFFSET_TS, _CALIBRATED
     log("🔄 正在与 B 站服务器校时…")
     offsets = []
-    last_err = ""
     for _ in range(samples):
         t0 = time.time()
-        try:
-            server = None
-            for url, key in _TIME_SOURCES:
+        server = None
+        for url, key in _TIME_SOURCES:
+            try:
                 r = sess.get(url, timeout=2)
-                body_preview = r.text[:120].replace("\n", " ") if r.text else ""
-                print("SRC", url.split("/x/")[-1][:25], "HTTP", r.status_code,
-                      "CT", r.headers.get("content-type"), "BODY", body_preview)
-                if not r.headers.get("content-type", "").startswith("application/json"):
-                    continue
-                try:
+                if r.headers.get("content-type", "").startswith("application/json"):
                     j = r.json()
-                    if key in j:
-                        server = j.get(key)
-                    else:
-                        server = j.get("data", {}).get(key)
-                    if isinstance(server, (int, float)) and server > 1e12:
-                        server /= 1000.0
-                except Exception:
-                    server = None
-                if server:
-                    break
-            t1 = time.time()
-            if server:
-                offsets.append(server - (t0 + t1) / 2)
-            else:
-                last_err = "no server time"
-        except Exception as e:
-            last_err = str(e)
+                    s = j.get(key) or j.get("data", {}).get(key)
+                    if isinstance(s, (int, float)) and s > 1e12:
+                        s /= 1000.0
+                    if s:
+                        server = s
+                        break
+            except Exception:
+                continue
+        t1 = time.time()
+        if server:
+            offsets.append(server - (t0 + t1) / 2)
         time.sleep(0.3)
 
     if offsets:
         _TIME_OFFSET = statistics.mean(offsets)
         _OFFSET_TS   = time.time()
-        log(f"⏱️  时差校准成功: {_TIME_OFFSET*1000:.1f} ms (样本数={len(offsets)})")
+        log(f"⏱️  时差校准成功: {_TIME_OFFSET*1000:.1f} ms")
+        _CALIBRATED = True
     else:
-        log(f"⚠️  时差校准失败，未能获取服务器时间，最后一次错误: {last_err}")
+        log("⚠️  时差校准失败")
+        _CALIBRATED = True
 
 def now_server() -> float:
-    if time.time() - _OFFSET_TS > 300:
+    if _CALIBRATED and time.time() - _OFFSET_TS > 300:
         threading.Thread(target=_calibrate_offset, daemon=True).start()
     return time.time() + _TIME_OFFSET
-
-# 移除启动时强制校时，改为菜单手动触发
 
 # ── 4. 场次相关 API ──
 INFO_URL = "https://api.bilibili.com/x/activity/bws/online/park/reserve/info"
@@ -213,42 +203,28 @@ def fetch_info(reserve_type=0):
         "year": "202601"
     }
     r = sess.get(INFO_URL, params=params, cookies=COOKIE_DICT, timeout=5)
-    if CFG.get("debug"):
-        dbg("请求URL:", r.url[:300])
-        dbg("HTTP", r.status_code, "响应前200:", r.text[:200])
     try:
         resp = r.json()
     except Exception:
-        raise RuntimeError(f"非JSON响应 HTTP={r.status_code} body={r.text[:200]}")
+        raise RuntimeError(f"非JSON响应 HTTP={r.status_code}")
     if resp["code"] != 0:
         if resp["code"] == 75638:
-            raise RuntimeError(
-                "❌ 账号未绑定门票\n"
-                "1. 请用浏览器打开 https://www.bilibili.com/blackboard/era/bws2026-event.html 确认已绑定门票\n"
-                "2. 重新获取 Cookie 后重试\n"
-                "3. 检查 TICKET_DAYS 与门票日期匹配"
-            )
+            raise RuntimeError("❌ 账号未绑定门票，请检查Cookie/门票绑定")
         raise RuntimeError(f"接口错误 code={resp['code']} msg={resp.get('message')}")
-    if CFG.get("debug"):
-        filename = "_bw_goods.json" if reserve_type == 1 else "_bw_info.json"
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(resp, f, ensure_ascii=False, indent=2)
-        dbg("JSON saved")
     return resp["data"]
 
 def fetch_goods():
     try:
         return fetch_info(reserve_type=1)
-    except Exception as e:
-        dbg("fetch_goods error:", e)
+    except Exception:
         return None
 
-def _norm_status(start_ts: int, remain: int, now: float) -> int:
+def _norm_status(start_ts, remain, now):
     if now < start_ts:
         return 0
     return 2 if remain <= 0 else 1
 
-def parse_goods(data) -> list:
+def parse_goods(data):
     if not data:
         return []
     raw = data.get("reserve_list", {})
@@ -282,8 +258,7 @@ def parse_goods(data) -> list:
         start_str = f"{dt.month}月{dt.day}日 {dt.strftime('%H:%M:%S')}" if dt else "??:??:??"
         date_key = itm.get("_date") or str(itm.get("screen_date", ""))
         ticket_no = ticket_map.get(date_key, "")
-        action_url = (itm.get("reserve_action_url") or itm.get("button_link") or
-                      itm.get("url") or (DO_URL if ticket_no else RESV_URL))
+        action_url = itm.get("reserve_action_url") or itm.get("button_link") or itm.get("url") or (DO_URL if ticket_no else RESV_URL)
         lst.append({
             "id": itm.get("reserve_id"),
             "title": f"[商品] {title}",
@@ -300,7 +275,7 @@ def parse_goods(data) -> list:
     lst.sort(key=lambda x: x["start"])
     return lst
 
-def parse_sessions(data) -> list:
+def parse_sessions(data):
     raw = data.get("reserve_list", [])
     if isinstance(raw, str):
         try:
@@ -325,28 +300,19 @@ def parse_sessions(data) -> list:
     for itm in raw:
         if not isinstance(itm, dict):
             continue
-        if CFG.get("debug"):
-            rid_dbg = itm.get("reserve_id")
-            url_candidates = {k: v for k, v in itm.items()
-                               if isinstance(v, str) and ("reserve" in v and "http" in v)}
-            if url_candidates:
-                dbg("URL-CANDS", rid_dbg, url_candidates)
         start_ts = int(itm.get("reserve_begin_time") or itm.get("reserve_time") or 0)
-        title_raw = (itm.get("title") or itm.get("act_title") or
-                     itm.get("sku_name") or "")
+        title_raw = (itm.get("title") or itm.get("act_title") or itm.get("sku_name") or "")
         loc   = itm.get("reserve_location", "")
         title = f"{title_raw}｜{loc}" if loc else title_raw
         remain = int(itm.get("standard_stock", itm.get("surplus", 0)))
         next_open_ts = int(itm.get("next_reserve", {}).get("reserve_begin_time", 0))
         if next_open_ts > start_ts:
             start_ts = next_open_ts
-        display_ts = start_ts
-        dt = datetime.fromtimestamp(display_ts) if display_ts else None
+        dt = datetime.fromtimestamp(start_ts) if start_ts else None
         start_str = f"{dt.month}月{dt.day}日 {dt.strftime('%H:%M:%S')}" if dt else "??:??:??"
         date_key = itm.get("_date") or str(itm.get("screen_date", ""))
         ticket_no = ticket_map.get(date_key, "")
-        action_url = (itm.get("reserve_action_url") or itm.get("button_link") or
-                       itm.get("url") or (DO_URL if ticket_no else RESV_URL))
+        action_url = itm.get("reserve_action_url") or itm.get("button_link") or itm.get("url") or (DO_URL if ticket_no else RESV_URL)
         lst.append({
             "id":       itm.get("reserve_id"),
             "title":    title,
@@ -355,7 +321,7 @@ def parse_sessions(data) -> list:
             "remain":   remain,
             "total":    int(itm.get("standard_ticket_num", itm.get("total", 0))),
             "status":   _norm_status(start_ts, remain, now),
-            "next_open": int(itm.get("next_reserve", {}).get("reserve_begin_time", 0)),
+            "next_open": next_open_ts,
             "url":      action_url,
             "ticket":   ticket_no,
             "is_goods": False
@@ -363,7 +329,7 @@ def parse_sessions(data) -> list:
     lst.sort(key=lambda x: x["start"])
     return lst
 
-def group_by_start(sessions: list):
+def group_by_start(sessions):
     mp = {}
     for s in sessions:
         mp.setdefault(s["start"], []).append(s)
@@ -376,8 +342,7 @@ def print_sessions(lst):
     for idx, it in enumerate(lst, 1):
         mark = mark_map.get(it["status"], f"状态{it['status']}")
         tag = "🛒" if it.get("is_goods") else "🎫"
-        log(f" {idx:02d}  {tag} id={it['id']}  {it['start_s']}  "
-            f"余{it['remain']:>4}/{it['total']:<4}  {mark}  {it['title']}")
+        log(f" {idx:02d}  {tag} id={it['id']}  {it['start_s']}  余{it['remain']:>4}/{it['total']:<4}  {mark}  {it['title']}")
     print()
 
 # ── 5. 预约接口 ──
@@ -386,48 +351,44 @@ DO_URL   = "https://api.bilibili.com/x/activity/bws/online/park/reserve/do"
 _CODE_RE = re.compile(rb'"code":\s*(-?\d+)')
 _SUCCESS_BYTES = b'"code":0'
 
+# 预生成随机 UA 片段，减少热路径中 random.randint 与字符串拼接开销
+_UA_POOL = [f"125.0.{random.randint(0,9)}.{random.randint(0,99)}" for _ in range(100)]
+
 def reserve_once(reserve_id: int, url_use: str | None = None, ticket: str = ""):
     if CFG["dry_run"]:
         return {"code": 0, "message": "dry-run"}
-    import random
     ts = int(time.time() * 1000)
     nonce = random.randint(10000, 99999)
     if ticket:
-        payload = (f"inter_reserve_id={reserve_id}&ticket_no={ticket}&csrf={BILI_JCT}&ts={ts}&_={nonce}").encode()
+        payload = f"inter_reserve_id={reserve_id}&ticket_no={ticket}&csrf={BILI_JCT}&ts={ts}&_={nonce}".encode()
         if url_use is None:
             url_use = DO_URL
     else:
-        payload = (f"csrf={BILI_JCT}&reserve_id={reserve_id}&reserve_type={CFG['reserve_type']}&ts={ts}&_={nonce}").encode()
+        payload = f"csrf={BILI_JCT}&reserve_id={reserve_id}&reserve_type={CFG['reserve_type']}&ts={ts}&_={nonce}".encode()
         if url_use is None:
             url_use = RESV_URL
+
+    _hdr = HEADERS.copy()
+    _hdr["content-type"] = "application/x-www-form-urlencoded"
+    # 快速替换 UA 尾部
+    _hdr["user-agent"] = _hdr["user-agent"].replace("125.0.0.0", random.choice(_UA_POOL))
+
     try:
-        _hdr = HEADERS.copy()
-        _hdr["content-type"] = "application/x-www-form-urlencoded"
-        _hdr["user-agent"] = _hdr["user-agent"].replace("125.0.0.0", f"125.0.{random.randint(0,9)}.{random.randint(0,99)}")
-        dbg("POST", url_use)
-        resp = _http_post(url_use, payload, _hdr)
+        resp = _post_func(url_use, payload, _hdr)
         if resp.status_code == 404 and not (ticket and url_use.endswith("/reserve/do")):
             base = url_use.rsplit("/reserve", 1)[0]
-            alt_paths = [
-                "/reserve/apply", "/reserve/v2/add", "/reserve/v3/add",
-                "/v2/reserve/add", "/v3/reserve/add", "/ticket/apply",
-                "/ticket/reserve/add", "/reserve/add"
-            ]
-            for ap in alt_paths:
+            for ap in ["/reserve/apply", "/reserve/v2/add", "/reserve/v3/add",
+                       "/v2/reserve/add", "/v3/reserve/add", "/ticket/apply",
+                       "/ticket/reserve/add", "/reserve/add"]:
                 alt_url = base + ap
                 try:
-                    dbg("probe", alt_url)
-                    resp = _http_post(alt_url, payload, _hdr)
+                    resp = _post_func(alt_url, payload, _hdr)
                     if resp.status_code != 404:
-                        dbg("hit", alt_url, resp.status_code)
                         break
-                except Exception as _e:
-                    dbg("probe exc", alt_url, _e)
-            content = resp.content
-        else:
-            content = resp.content
+                except Exception:
+                    continue
+        content = resp.content
         if not resp.headers.get("content-type", "").startswith("application/json"):
-            dbg("HTTP", resp.status_code, "NON-JSON", content[:120])
             return {"code": resp.status_code, "message": "non-json"}
         if _SUCCESS_BYTES in content:
             return {"code": 0, "message": ""}
@@ -436,109 +397,121 @@ def reserve_once(reserve_id: int, url_use: str | None = None, ticket: str = ""):
             return {"code": int(m.group(1)), "message": ""}
         return _fast_json_loads(content)
     except Exception as e:
-        dbg("EXC", e)
         return {"code": -1, "message": str(e)}
 
-# ── 6. 抢票核心 ──
-def wait_until(server_ts: int):
+# ── 6. 抢票核心（极致优化版） ──
+def wait_until(server_ts):
     while True:
         delta = server_ts - now_server()
         if delta <= 0:
             break
         if delta > 60:
-            log(f"⌛ 距目标 {int(delta) // 60}m{int(delta) % 60:02d}s")
+            log(f"⌛ 距目标 {int(delta)//60}m{int(delta)%60:02d}s")
             time.sleep(60)
         else:
-            time.sleep(5 if delta > 10 else max(0.5, delta / 2))
+            time.sleep(5 if delta > 10 else max(0.5, delta/2))
 
-def gun_worker(reserve_id: int, fire_ts_server: float, action_url: str, ticket: str = "", thread_id: int = 0):
-    import random
-    requests_count = CFG.get("requests_per_thread", 2)
-    jitter_ms = CFG.get("time_jitter_ms", 15)
-    retry_delays = CFG.get("retry_delays", {})
-    default_delay = retry_delays.get("default", 200)
+def gun_worker(reserve_id, fire_ts_server, action_url, ticket, thread_id):
+    # 将所有外部变量缓存为局部变量，避免属性查询
+    req_cnt = CFG["requests_per_thread"]
+    jitter_ms = CFG["time_jitter_ms"]
+    retry_delays = CFG["retry_delays"]
+    default_delay = retry_delays["default"]
+    time_offset = _TIME_OFFSET
+    perf_offset = _PERF_OFFSET_NS
+    stop_event = STOP_RESERVE
 
-    for req_idx in range(requests_count):
-        if STOP_RESERVE.is_set():
-            dbg(f"线程{thread_id} 收到全局停止信号，退出")
+    for req_idx in range(req_cnt):
+        if stop_event.is_set():
             return
 
-        # 纳秒忙等
+        # 计算精准发射时间（纳秒忙等）
         jitter_sec = random.uniform(-jitter_ms, jitter_ms) / 1000.0
         fire_time = fire_ts_server + jitter_sec + (req_idx * 0.05)
-        fire_local = fire_time - _TIME_OFFSET
+        fire_local = fire_time - time_offset
         early = fire_local - time.time()
         if early > 0.25:
             time.sleep(early - 0.20)
-        target_ns = int(fire_time * 1e9 + _PERF_OFFSET_NS)
+        target_ns = int(fire_time * 1e9 + perf_offset)
         while time.perf_counter_ns() < target_ns:
             pass
 
         ret = reserve_once(reserve_id, action_url, ticket)
-        code = ret.get("code")
+        code = ret["code"]
         msg = ret.get("message", "")
 
-        # 成功
         if code == 0:
             log(f"\033[92m🔫 {reserve_id} 成功 [线程{thread_id} 请求{req_idx}]\033[0m")
             return
 
-        # 根据状态码获取等待时间
         delay_ms = retry_delays.get(str(code), default_delay)
         delay_sec = delay_ms / 1000.0
 
-        # 细分处理
+        # 细分状态处理
         if code == 75637:
-            log(f"[75637] 尚未开放，线程{thread_id} 等待 {delay_ms}ms 后重试")
-        elif code == 75574:
-            log(f"\033[91m[75574] 预约已被抢空！线程{thread_id} 退出\033[0m")
-            STOP_RESERVE.set()
-            return
-        elif code == 76674:
-            log(f"\033[91m[76674] 预约已达上限！线程{thread_id} 退出\033[0m")
-            STOP_RESERVE.set()
+            log(f"[75637] 尚未开放，线程{thread_id} 等待 {delay_ms}ms")
+        elif code in (75574, 76674):
+            log(f"\033[91m[{code}] 已抢空/达上限，线程{thread_id} 退出\033[0m")
+            stop_event.set()
             return
         elif code == 412:
-            log(f"\033[91m[412] 风控！线程{thread_id} 等待 {delay_ms}ms 后重试\033[0m")
+            log(f"\033[91m[412] 风控！线程{thread_id} 等待 {delay_ms}ms\033[0m")
         elif code == 429:
             log(f"[429] 限流，线程{thread_id} 等待 {delay_ms}ms")
         elif code == 76650:
             log(f"[76650] 操作频繁，线程{thread_id} 等待 {delay_ms}ms")
         elif code == -702:
-            log(f"[-702] 请求频率太快，线程{thread_id} 等待 {delay_ms}ms")
+            log(f"[-702] 频率太快，线程{thread_id} 等待 {delay_ms}ms")
         elif code == -1:
             log(f"[-1] 网络错误，线程{thread_id} 等待 {delay_ms}ms")
         else:
             log(f"\033[91m❌ 未知状态码 {code} msg={msg} 线程{thread_id} 等待 {delay_ms}ms\033[0m")
 
         time.sleep(delay_sec)
-        # 继续循环尝试下一个请求
 
-    log(f"\033[91m❌ {reserve_id} 失败 [线程{thread_id}] 已发送{requests_count}次请求\033[0m")
+    log(f"\033[91m❌ {reserve_id} 失败 [线程{thread_id}] 已发送{req_cnt}次请求\033[0m")
 
-def _preheat_connection(url: str = RESV_URL, rounds=None):
-    try:
-        payload = f"csrf={BILI_JCT}&reserve_id=0&reserve_type={CFG['reserve_type']}".encode()
-        if rounds is None:
-            rounds = min(CFG.get("preheat_rounds", 8), CFG["threads"])
-        for _ in range(rounds):
-            _http_post(url, payload, {"content-type": "application/x-www-form-urlencoded"})
-    except Exception:
-        pass
-
-def preheat_ids(id_list, url_map, rounds=None):
-    if rounds is None:
-        rounds = min(CFG.get("preheat_rounds", 8), CFG["threads"])
-    for rid in id_list:
-        url = url_map.get(rid, RESV_URL)
+def _preheat_connection(url=RESV_URL, rounds=None):
+    payload = f"csrf={BILI_JCT}&reserve_id=0&reserve_type={CFG['reserve_type']}".encode()
+    rounds = rounds or min(CFG["preheat_rounds"], CFG["threads"])
+    for _ in range(rounds):
         try:
-            payload = f"csrf={BILI_JCT}&reserve_id={rid}&reserve_type={CFG['reserve_type']}".encode()
-            for _ in range(rounds):
-                _http_post(url, payload, {"content-type": "application/x-www-form-urlencoded"})
+            _post_func(url, payload, {"content-type": "application/x-www-form-urlencoded"})
         except Exception:
             pass
 
-def fire_one(ses: dict):
+def preheat_ids(id_list, url_map, rounds=None):
+    rounds = rounds or min(CFG["preheat_rounds"], CFG["threads"])
+    for rid in id_list:
+        url = url_map.get(rid, RESV_URL)
+        payload = f"csrf={BILI_JCT}&reserve_id={rid}&reserve_type={CFG['reserve_type']}".encode()
+        for _ in range(rounds):
+            try:
+                _post_func(url, payload, {"content-type": "application/x-www-form-urlencoded"})
+            except Exception:
+                pass
+
+# 暂停检测（轻量级）
+def _check_pause():
+    if msvcrt is None or not msvcrt.kbhit():
+        return False
+    ch = msvcrt.getch()
+    if ch in (b'\x00', b'\xe0'):
+        ch2 = msvcrt.getch()
+        if ch2 == b';':          # F1
+            log("\n⏸️  暂停：检测到 F1 键")
+            while True:
+                choice = input("c 继续 / q 退出: ").strip().lower()
+                if choice == 'c':
+                    log("▶️  继续抢票...")
+                    return False
+                elif choice == 'q':
+                    log("🛑 退出抢票，返回主菜单...")
+                    STOP_RESERVE.set()
+                    return True
+    return False
+
+def fire_one(ses):
     if ses["remain"] <= 0 and ses["next_open"] > ses["start"]:
         if ses["next_open"] > now_server():
             fmt = datetime.fromtimestamp(ses["next_open"]).strftime("%H:%M:%S")
@@ -558,18 +531,28 @@ def fire_one(ses: dict):
             print(f"\r⌛ 距开抢 {sec:>4d}s", end="", flush=True)
             last_sec = sec
         time.sleep(1)
+        if _check_pause():
+            return False
+
     _preheat_connection(ses["url"])
-    log(f"▶️  {ses['id']} {ses['title']}  {ses['start_s']}  即将开枪(提前 {CFG['ahead_sec']}s)  URL={ses['url']}")
+    log(f"▶️  {ses['id']} {ses['title']}  {ses['start_s']}  即将开枪(提前 {CFG['ahead_sec']}s)")
     ths = [threading.Thread(target=gun_worker,
                             args=(ses["id"], fire_at_server, ses["url"], ses["ticket"], i))
            for i in range(CFG["threads"])]
     for t in ths:
         t.start()
     for t in ths:
-        t.join()
+        while t.is_alive():
+            t.join(timeout=0.1)
+            if _check_pause():
+                # 快速通知所有线程停止
+                for t2 in ths:
+                    t2.join(timeout=0.5)
+                return False
+    return True
 
-def fire_group(sess_list: list):
-    STOP_RESERVE.clear()  # 重置全局停止标志
+def fire_group(sess_list):
+    STOP_RESERVE.clear()
     for s in sess_list:
         if s["remain"] <= 0 and s["next_open"] > s["start"]:
             if s["next_open"] > now_server():
@@ -594,10 +577,12 @@ def fire_group(sess_list: list):
             sys.stdout.flush()
             last_sec = sec_left
         time.sleep(0.2)
+        if _check_pause():
+            return False
+
     _preheat_connection(sess_list[0]["url"])
     for s in sess_list:
-        log(f"▶️  {s['id']} {s['title']}  {s['start_s']}  "
-            f"即将开枪(提前 {CFG['ahead_sec']}s)  URL={s['url']}")
+        log(f"▶️  {s['id']} {s['title']}  {s['start_s']}  即将开枪(提前 {CFG['ahead_sec']}s)")
     ths = []
     thread_id = 0
     for s in sess_list:
@@ -607,10 +592,68 @@ def fire_group(sess_list: list):
             thread_id += 1
     for t in ths:
         t.start()
+    # 等待所有线程结束，同时检测暂停
     for t in ths:
-        t.join()
+        while t.is_alive():
+            t.join(timeout=0.1)
+            if _check_pause():
+                for t2 in ths:
+                    t2.join(timeout=0.5)
+                return False
+    return True
 
-# ── 7. 菜单/业务函数 ──
+# ── 7. 已选目标管理 ──
+SELECTED_TARGET_IDS = []
+
+def _select_targets_interactive():
+    sesses = parse_sessions(fetch_info(reserve_type=0))
+    goods_data = fetch_goods()
+    goods_lst = parse_goods(goods_data) if goods_data else []
+    all_items = sesses + goods_lst
+    if not all_items:
+        log("⚠️ 没有可用的场次或商品")
+        return []
+
+    ids_in = input("输入要抢的 id（逗号分隔）、auto 自动挑选、或关键词: ").strip()
+    if ids_in.lower() == "auto":
+        now = now_server()
+        targets = [s for s in all_items if s["status"] == 0 and s["start"] > now]
+    elif ids_in.replace(",", "").replace(" ", "").isdigit():
+        wanted = {int(x) for x in ids_in.replace(" ", "").split(",") if x.strip().isdigit()}
+        targets = [s for s in all_items if s["id"] in wanted]
+    else:
+        keyword = ids_in.lower()
+        targets = [s for s in all_items if keyword in s["title"].lower()]
+        if targets:
+            log(f"🔍 找到 {len(targets)} 个匹配 '{ids_in}' 的项目：")
+            for s in targets:
+                tag = "🛒" if s.get("is_goods") else "🎫"
+                log(f"   {tag} {s['id']} - {s['title']} ({s['start_s']})")
+            if input("确认抢这些项目？(y/n): ").strip().lower() != "y":
+                log("已取消")
+                return []
+    if not targets:
+        log("⚠️ 没有符合条件的项目")
+        return []
+    log("已选择以下目标：")
+    for s in targets:
+        tag = "🛒" if s.get("is_goods") else "🎫"
+        log(f"   {tag} {s['id']} - {s['title']} ({s['start_s']})")
+    return targets
+
+def _execute_grab(targets):
+    if not targets:
+        return
+    groups = group_by_start(targets)
+    id_to_url = {s["id"]: s["url"] for _ts, g in groups for s in g}
+    preheat_ids(list(id_to_url.keys()), id_to_url)
+    for start_ts, ses_lst in groups:
+        if not fire_group(ses_lst):
+            log("抢票已被用户中断")
+            break
+    log("🚩 抢票流程结束")
+
+# ── 8. 菜单/业务函数 ──
 def check_cookie():
     nav_api = "https://api.bilibili.com/x/web-interface/nav"
     j = sess.get(nav_api, timeout=5).json()
@@ -633,42 +676,53 @@ def show_today():
         print_sessions(goods_lst)
     if not lst and not goods_lst:
         log("⚠️  没有找到任何场次或商品")
-        log("💡 提示：检查 TICKET_DAYS 配置，确保包含有票的日期")
 
 def grab_flow():
-    ids_in = input("输入要抢的 id（逗号分隔）、auto 自动挑选、或关键词（如 5070/RTX）: ").strip()
+    global SELECTED_TARGET_IDS, _CALIBRATED
+
     sesses = parse_sessions(fetch_info(reserve_type=0))
     goods_data = fetch_goods()
     goods_lst = parse_goods(goods_data) if goods_data else []
     all_items = sesses + goods_lst
-    if ids_in.lower() == "auto":
-        now = now_server()
-        targets = [s for s in all_items
-                   if s["status"] == 0 and s["start"] > now]
-    elif ids_in.replace(",", "").replace(" ", "").isdigit():
-        wanted = {int(x) for x in ids_in.replace(" ", "").split(",") if x.strip().isdigit()}
-        targets = [s for s in all_items if s["id"] in wanted]
-    else:
-        keyword = ids_in.lower()
-        targets = [s for s in all_items if keyword in s["title"].lower()]
-        if targets:
-            log(f"🔍 找到 {len(targets)} 个匹配 '{ids_in}' 的项目：")
-            for s in targets:
+
+    targets = []
+    if SELECTED_TARGET_IDS:
+        id_set = set(SELECTED_TARGET_IDS)
+        valid = [s for s in all_items if s["id"] in id_set and s["status"] == 0 and s["start"] > now_server()]
+        if valid:
+            log(f"📌 已有已选目标 ({len(valid)} 个)：")
+            for s in valid:
                 tag = "🛒" if s.get("is_goods") else "🎫"
                 log(f"   {tag} {s['id']} - {s['title']} ({s['start_s']})")
-            confirm = input("确认抢这些项目？(y/n): ").strip().lower()
-            if confirm != "y":
-                log("已取消")
-                return
+            choice = input("是否直接抢这些目标？(y=继续 / n=重新选择): ").strip().lower()
+            if choice == 'y':
+                targets = valid
+            else:
+                SELECTED_TARGET_IDS.clear()
+                log("已清除旧目标，请重新选择：")
+        else:
+            log("⚠️ 已选目标不再有效，自动清除。")
+            SELECTED_TARGET_IDS.clear()
+
     if not targets:
-        log("⚠️  没有符合条件的项目")
+        targets = _select_targets_interactive()
+        if targets:
+            SELECTED_TARGET_IDS = [s["id"] for s in targets]
+            log(f"✅ 目标已保存，共 {len(targets)} 个")
+
+    if not targets:
+        log("未选择目标，返回主菜单")
         return
-    groups = group_by_start(targets)
-    id_to_url = {s["id"]: s["url"] for _ts, g in groups for s in g}
-    preheat_ids(list(id_to_url.keys()), id_to_url)
-    for start_ts, ses_lst in groups:
-        fire_group(ses_lst)
-    log("🚩 抢票流程结束")
+
+    if not _CALIBRATED:
+        log("⏱️  时间尚未校准，正在自动校准...")
+        _calibrate_offset()
+        if not _CALIBRATED:
+            log("⚠️  自动校准失败，无法抢票。请手动校准后重试（菜单 1）")
+            return
+        log("✅ 校准完成，立即开始抢票")
+
+    _execute_grab(targets)
 
 def set_params():
     try:
@@ -680,67 +734,90 @@ def set_params():
             log(f"购票日期已更新: {TICKET_DAYS}")
         a = float(input(f"提前秒[{CFG['ahead_sec']}]: ") or CFG['ahead_sec'])
         th = int(input(f"并发线程[{CFG['threads']}]: ") or CFG['threads'])
-        rpt = int(input(f"每线程请求数[{CFG.get('requests_per_thread', 2)}]: ") or CFG.get('requests_per_thread', 2))
-        jit = int(input(f"时间抖动ms[{CFG.get('time_jitter_ms', 15)}]: ") or CFG.get('time_jitter_ms', 15))
+        rpt = int(input(f"每线程请求数[{CFG['requests_per_thread']}]: ") or CFG['requests_per_thread'])
+        jit = int(input(f"时间抖动ms[{CFG['time_jitter_ms']}]: ") or CFG['time_jitter_ms'])
         CFG.update(ahead_sec=a, threads=th, requests_per_thread=rpt, time_jitter_ms=jit)
-        # 修改重试延迟
         print("\n当前重试延迟(ms):")
-        for k, v in CFG.get("retry_delays", {}).items():
+        for k, v in CFG["retry_delays"].items():
             print(f"  {k}: {v}")
-        mod = input("是否修改重试延迟？(y/n): ").strip().lower()
-        if mod == "y":
+        if input("是否修改重试延迟？(y/n): ").strip().lower() == "y":
             for key in CFG["retry_delays"]:
                 if key == "default": continue
                 val = input(f"  {key} 延迟(ms)[{CFG['retry_delays'][key]}]: ").strip()
                 if val:
                     CFG["retry_delays"][key] = int(val)
-            val = input(f"  默认延迟(ms)[{CFG['retry_delays'].get('default', 200)}]: ").strip()
+            val = input(f"  默认延迟(ms)[{CFG['retry_delays']['default']}]: ").strip()
             if val:
                 CFG["retry_delays"]["default"] = int(val)
         log("参数已更新:", CFG)
     except Exception as e:
         log("输入有误:", e)
 
-# ── 8. 压测等 ──
-def pressure_test():
-    levels = [8, 16, 32, 48, 64]
-    log("🧪 开始压测… (仅本地统计延迟，不会实际预约)")
-    for th in levels:
-        lat = []
-        http_stats = []
-        biz_codes = []
-        def _w():
-            payload = (f"csrf={BILI_JCT}&reserve_id=0&reserve_type={CFG['reserve_type']}").encode()
-            t0 = time.perf_counter()
-            try:
-                resp = _http_post(RESV_URL, payload, {"content-type": "application/x-www-form-urlencoded"})
-                http_stats.append(resp.status_code)
-                m = _CODE_RE.search(resp.content)
-                if m:
-                    biz_codes.append(int(m.group(1)))
-            except Exception:
-                http_stats.append(-1)
-            finally:
-                lat.append(time.perf_counter() - t0)
-        threads = [threading.Thread(target=_w) for _ in range(th)]
-        t_begin = time.perf_counter()
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        cost = time.perf_counter() - t_begin
-        mean_ms = statistics.mean(lat) * 1000
-        p90_ms  = sorted(lat)[int(0.9 * len(lat) - 1)] * 1000
-        from collections import Counter
-        http_cnt = Counter(http_stats)
-        biz_cnt  = Counter(biz_codes)
-        http_str = ", ".join(f"{k}:{v}" for k, v in sorted(http_cnt.items()))
-        biz_str  = ", ".join(f"{k}:{v}" for k, v in sorted(biz_cnt.items())) or "--"
-        log(f"线程 {th:>2d}  耗时 {cost:.2f}s  平均 {mean_ms:.1f} ms  P90 {p90_ms:.1f} ms  "
-            f"HTTP({http_str})  code({biz_str})")
-    log("🧪 压测结束")
+# ── 9. 压测与推荐 ──
+def _auto_pressure_tune():
+    thread_levels = [8, 16, 24, 32, 40, 48, 56, 64]
+    rpt_levels = [1, 2, 3, 4]
+    log(f"将测试线程数 {thread_levels} 和每线程请求数 {rpt_levels} 的组合...")
+    results = []
 
-# 颜色辅助
+    for rpt in rpt_levels:
+        for th in thread_levels:
+            lat = []
+            http_stats = []
+            biz_codes = []
+
+            def _w(rpt=rpt):
+                payload = f"csrf={BILI_JCT}&reserve_id=0&reserve_type={CFG['reserve_type']}".encode()
+                hdr = {"content-type": "application/x-www-form-urlencoded"}
+                for _ in range(rpt):
+                    t0 = time.perf_counter()
+                    try:
+                        resp = _post_func(RESV_URL, payload, hdr)
+                        http_stats.append(resp.status_code)
+                        m = _CODE_RE.search(resp.content)
+                        if m:
+                            biz_codes.append(int(m.group(1)))
+                    except Exception:
+                        http_stats.append(-1)
+                    finally:
+                        lat.append(time.perf_counter() - t0)
+
+            threads = [threading.Thread(target=_w) for _ in range(th)]
+            t_begin = time.perf_counter()
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            cost = time.perf_counter() - t_begin
+
+            mean_ms = statistics.mean(lat) * 1000
+            p90_ms = sorted(lat)[int(0.9 * len(lat)) - 1] * 1000 if len(lat) >= 10 else mean_ms * 1.5
+            total_req = th * rpt
+            results.append((th, rpt, mean_ms, p90_ms, cost, total_req))
+            log(f"线程 {th:>2d} * 请求/线程 {rpt} (总{total_req:>3d})  平均 {mean_ms:.1f}ms  P90 {p90_ms:.1f}ms")
+
+    best = None
+    best_score = -1
+    for th, rpt, mean, p90, cost, total in results:
+        if mean < 200 and p90 < 300:
+            if total > best_score or (total == best_score and best and mean < best[2]):
+                best_score = total
+                best = (th, rpt, mean, p90, cost, total)
+
+    if best is None:
+        best = min(results, key=lambda x: x[2])
+        log(f"⚠️ 推荐平均延迟最小的组合: 线程 {best[0]}, 每线程请求 {best[1]} (平均 {best[2]:.1f}ms)")
+    else:
+        log(f"✅ 推荐最佳配置: 线程 {best[0]}, 每线程请求 {best[1]} (总请求 {best[5]}) 平均 {best[2]:.1f}ms")
+
+    if input("是否应用推荐配置？(y/n): ").strip().lower() == 'y':
+        CFG['threads'] = best[0]
+        CFG['requests_per_thread'] = best[1]
+        log(f"参数已应用！线程数={best[0]}, 每线程请求数={best[1]}")
+    else:
+        log("未应用")
+
+# ── 10. 界面辅助 ──
 class _CLR:
     HEADER = '\033[95m' if sys.platform != 'win32' else ''
     BLUE = '\033[94m' if sys.platform != 'win32' else ''
@@ -750,130 +827,78 @@ class _CLR:
     END = '\033[0m' if sys.platform != 'win32' else ''
     BOLD = '\033[1m' if sys.platform != 'win32' else ''
 
-def _print_header(title: str):
-    print(f"\n{_CLR.BOLD}{_CLR.BLUE}{'=' * 50}{_CLR.END}")
+def _print_header(title):
+    print(f"\n{_CLR.BOLD}{_CLR.BLUE}{'='*50}{_CLR.END}")
     print(f"{_CLR.BOLD}{_CLR.BLUE}  {title}{_CLR.END}")
-    print(f"{_CLR.BOLD}{_CLR.BLUE}{'=' * 50}{_CLR.END}")
+    print(f"{_CLR.BOLD}{_CLR.BLUE}{'='*50}{_CLR.END}")
 
 def _print_config():
-    day_names = {1: "10", 2: "11", 3: "12"}
-    days_str = ",".join(day_names.get(d, str(d)) for d in TICKET_DAYS)
+    days_str = ",".join({1:"10",2:"11",3:"12"}.get(d, str(d)) for d in TICKET_DAYS)
     dry = "ON" if CFG["dry_run"] else "OFF"
+    calib = "✅ 已校准" if _CALIBRATED else "❌ 未校准"
     print(f"{_CLR.YELLOW}⚙️  当前配置{_CLR.END}")
     print(f"   日期: 7月{days_str}日 | 提前: {CFG['ahead_sec']}s | 线程: {CFG['threads']} | "
-          f"每线程请求: {CFG.get('requests_per_thread',2)} | 抖动: ±{CFG.get('time_jitter_ms',15)}ms")
-    print(f"   Dry-Run: {dry}")
-    retry = CFG.get('retry_delays', {})
-    print(f"   重试延迟(ms): 75637={retry.get('75637',500)}, 412={retry.get('412',180000)}, "
-          f"429={retry.get('429',500)}, 76650={retry.get('76650',100)}, 默认={retry.get('default',200)}")
+          f"每线程请求: {CFG['requests_per_thread']} | 抖动: ±{CFG['time_jitter_ms']}ms")
+    print(f"   校时状态: {calib}  | Dry-Run: {dry}")
+    if SELECTED_TARGET_IDS:
+        print(f"   已选目标: {len(SELECTED_TARGET_IDS)} 个 (id: {', '.join(map(str, SELECTED_TARGET_IDS))})")
 
 def _manual_calibrate():
-    """手动触发校时"""
-    log("🔄 手动触发服务器校时...")
+    global _CALIBRATED
     _calibrate_offset()
-
-def _auto_pressure_tune():
-    """
-    自动压测并推荐最佳线程数。
-    指标：平均延迟 < 200ms 且 P90 < 400ms 的前提下，选择最大线程数；
-    若都不满足则选择平均延迟最小的配置。
-    """
-    _print_header("自动压测并推荐参数")
-    log("将测试线程数 [8, 16, 24, 32, 40, 48, 56, 64]，每个线程发送 2 次请求...")
-    results = []
-    levels = [8, 16, 24, 32, 40, 48, 56, 64]
-
-    for th in levels:
-        lat = []
-        http_stats = []
-        biz_codes = []
-
-        def _w():
-            payload = (f"csrf={BILI_JCT}&reserve_id=0&reserve_type={CFG['reserve_type']}").encode()
-            t0 = time.perf_counter()
-            try:
-                resp = _http_post(RESV_URL, payload, {"content-type": "application/x-www-form-urlencoded"})
-                http_stats.append(resp.status_code)
-                m = _CODE_RE.search(resp.content)
-                if m:
-                    biz_codes.append(int(m.group(1)))
-            except Exception:
-                http_stats.append(-1)
-            finally:
-                lat.append(time.perf_counter() - t0)
-
-        threads = [threading.Thread(target=_w) for _ in range(th)]
-        t_begin = time.perf_counter()
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        cost = time.perf_counter() - t_begin
-
-        mean_ms = statistics.mean(lat) * 1000
-        p90_ms = sorted(lat)[int(0.9 * len(lat)) - 1] * 1000 if len(lat) >= 10 else mean_ms * 1.5
-        results.append((th, mean_ms, p90_ms, cost, http_stats, biz_codes))
-        log(f"线程 {th:>2d}  总耗时 {cost:.2f}s  平均 {mean_ms:.1f}ms  P90 {p90_ms:.1f}ms")
-
-    # 分析推荐
-    best_th = None
-    best_mean = float('inf')
-    for th, mean, p90, *_ in results:
-        if mean < 200 and p90 < 400:
-            best_th = th  # 满足条件的最大线程会自然被最后覆盖
-    if best_th is None:
-        # 选择平均延迟最小的
-        best_th = min(results, key=lambda x: x[1])[0]
-        log(f"{_CLR.YELLOW}⚠️ 未找到完全满足延迟阈值的配置，推荐平均延迟最小的线程数: {best_th}{_CLR.END}")
-    else:
-        log(f"{_CLR.GREEN}✅ 推荐最佳线程数: {best_th}（平均延迟<200ms 且 P90<400ms）{_CLR.END}")
-
-    # 询问是否应用
-    choice = input(f"是否将线程数设为 {best_th}，每线程请求数设为 2？(y/n): ").strip().lower()
-    if choice == 'y':
-        CFG['threads'] = best_th
-        CFG['requests_per_thread'] = 2
-        log(f"{_CLR.GREEN}参数已应用！{_CLR.END}")
-    else:
-        log("未应用，可手动设置。")
+    if SELECTED_TARGET_IDS:
+        log(f"📌 当前已选目标: {SELECTED_TARGET_IDS}")
+        if input("是否立即使用已选目标开始抢票？(y/n): ").strip().lower() == 'y':
+            grab_flow()
+            return
+    log("返回主菜单。")
 
 def main():
-    # 不再自动校时
     while True:
         try:
             _print_header("BWS")
             _print_config()
-            print(f" {_CLR.BOLD}1{_CLR.END}) 检查 Cookie 有效性")
-            print(f" {_CLR.BOLD}2{_CLR.END}) 查看全部场次（活动+商品）")
-            print(f" {_CLR.BOLD}3{_CLR.END}) 自动抢票（支持 id/auto/关键词）")
-            print(f" {_CLR.BOLD}4{_CLR.END}) 手动设置参数")
-            print(f" {_CLR.BOLD}5{_CLR.END}) 切换 Dry-Run（当前：{CFG['dry_run']}）")
-            print(f" {_CLR.BOLD}6{_CLR.END}) 自动压测并推荐最优线程/并发")
-            print(f" {_CLR.BOLD}7{_CLR.END}) 校准服务器时间")
+            print(f" {_CLR.BOLD}1{_CLR.END}) 校准服务器时间（{_CLR.GREEN if _CALIBRATED else _CLR.RED}{'已校准' if _CALIBRATED else '未校准'}{_CLR.END}）")
+            print(f" {_CLR.BOLD}2{_CLR.END}) 检查 Cookie 有效性")
+            print(f" {_CLR.BOLD}3{_CLR.END}) 查看全部场次（活动+商品）")
+            print(f" {_CLR.BOLD}4{_CLR.END}) 自动抢票（选择目标 & 执行）")
+            print(f" {_CLR.BOLD}5{_CLR.END}) 手动设置参数")
+            print(f" {_CLR.BOLD}6{_CLR.END}) 切换 Dry-Run（当前：{CFG['dry_run']}）")
+            print(f" {_CLR.BOLD}7{_CLR.END}) 自动压测并推荐最优线程/并发")
+            if SELECTED_TARGET_IDS:
+                print(f" {_CLR.BOLD}8{_CLR.END}) 清除已选目标 (当前: {len(SELECTED_TARGET_IDS)} 个)")
+            else:
+                print(f" {_CLR.BOLD}8{_CLR.END}) 清除已选目标 (无)")
             print(f" {_CLR.BOLD}0{_CLR.END}) 退出")
-            print(f"{_CLR.BOLD}{_CLR.BLUE}{'=' * 50}{_CLR.END}")
+            print(f"{_CLR.BOLD}{_CLR.BLUE}{'='*50}{_CLR.END}")
             choice = input("请选择操作：").strip()
 
             if choice == "1":
-                check_cookie()
+                _manual_calibrate()
             elif choice == "2":
-                show_today()
+                check_cookie()
             elif choice == "3":
-                grab_flow()
+                show_today()
             elif choice == "4":
-                set_params()
+                grab_flow()
             elif choice == "5":
+                set_params()
+            elif choice == "6":
                 CFG["dry_run"] = not CFG["dry_run"]
                 log(f"Dry-Run 已切换为 {CFG['dry_run']}")
-            elif choice == "6":
-                _auto_pressure_tune()
             elif choice == "7":
-                _manual_calibrate()
+                _auto_pressure_tune()
+            elif choice == "8":
+                if SELECTED_TARGET_IDS:
+                    SELECTED_TARGET_IDS.clear()
+                    log("已清除所有已选目标。")
+                else:
+                    log("当前没有已选目标。")
             elif choice == "0":
                 log("👋 退出程序，再见！")
                 break
             else:
-                print(f"{_CLR.RED}请输入 0-7 之间的选项{_CLR.END}")
+                print(f"{_CLR.RED}请输入 0-8 之间的选项{_CLR.END}")
         except KeyboardInterrupt:
             print(f"\n{_CLR.YELLOW}^C 中断，程序退出{_CLR.END}")
             break
