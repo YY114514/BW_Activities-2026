@@ -1,4 +1,3 @@
-# BW乐园-2026
 本项目基于
 https://github.com/kaguraaya/bw-leyuan
 的项目进行修改
