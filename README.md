@@ -12,7 +12,7 @@ https://github.com/kaguraaya/bw-leyuan
 - 按配置的日期、并发和提前量执行预约请求
 - 支持 dry-run、延迟测试和简单压测
 - 支持 NTP 和B站服务器时间校准（建议运行时优先校准）
-- 
+
 ## 环境
 
 - Python 3.8+
